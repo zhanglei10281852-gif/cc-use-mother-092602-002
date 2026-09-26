@@ -12,6 +12,9 @@ from app.routers import affairs, announcements, departments, petitions, resident
 from app.seismic.router import router as seismic_router
 from app.seismic.service import ensure_schema as ensure_seismic_schema
 from app.compute.router import router as compute_router
+from app.radiation.router import router as radiation_router
+from app.radiation.schema import ensure_schema as ensure_radiation_schema
+from app.radiation.service import RadiationService
 
 
 @asynccontextmanager
@@ -19,6 +22,9 @@ async def lifespan(app: FastAPI):
     del app
     init_db()
     ensure_seismic_schema()
+    ensure_radiation_schema()
+    # 重启后以隔离记录为准，还原任务冻结状态
+    RadiationService().reconcile()
     yield
     close_connection()
 
@@ -51,6 +57,7 @@ app.include_router(departments.router)
 app.include_router(petitions.router)
 app.include_router(seismic_router)
 app.include_router(compute_router)
+app.include_router(radiation_router)
 
 
 @app.get("/")

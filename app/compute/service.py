@@ -63,12 +63,17 @@ class ComputeOperationsService:
                     raise ConflictError("同一幂等键对应了不同的计算参数")
                 return dict(repository.task_by_id(existing["id"]))
             self._check_quota(repository, payload["requested_by"], now_value)
-            return repository.create_task(
+            created = repository.create_task(
                 template_id=template["id"], project_code=payload["project_code"],
                 requested_by=payload["requested_by"], parameters=parameters,
                 parameter_digest=parameter_digest, priority=payload["priority"],
                 idempotency_key=payload["idempotency_key"], max_attempts=template["max_attempts"], now=now,
             )
+            # 辐射告警期间，新任务按活跃事件与当前隔离策略立即筛查（同事务）
+            from app.radiation.service import screen_task_against_active_events
+
+            screen_task_against_active_events(connection, created, now)
+            return dict(repository.task_by_id(created["id"]))
 
     def list_tasks(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_tasks(status=status, project_code=project_code, requested_by=requested_by, limit=max(1, min(limit, 500)))
@@ -161,6 +166,10 @@ class ComputeOperationsService:
                 raise ConflictError("只有失败或已取消任务可以人工重试")
             chosen = task["priority"] if priority is None else priority
             connection.execute("UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, task["id"]))
+            from app.radiation.service import screen_task_against_active_events
+
+            refreshed = ComputeRepository(connection).task_by_id(task["id"])
+            screen_task_against_active_events(connection, refreshed, now, actor=actor)
         return self._intervene(task_id, actor, reason, "retry", batch_key, mutate)
 
     def set_priority(self, task_id: int, actor: str, reason: str, priority: int, batch_key: str = "") -> dict[str, Any]:
