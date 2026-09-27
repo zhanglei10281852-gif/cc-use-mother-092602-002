@@ -67,7 +67,11 @@ class ComputeRepository:
             condition = f" AND tpl.algorithm IN ({placeholders})"
             params.extend(capability_list)
         return self.connection.execute(
-            "SELECT t.*,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.status='queued' AND t.available_at<=?" + condition + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
+            "SELECT t.*,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id "
+            "WHERE t.status='queued' AND t.available_at<=? "
+            "AND NOT EXISTS(SELECT 1 FROM radiation_quarantines q JOIN radiation_events e ON e.id=q.event_id "
+            "WHERE q.task_id=t.id AND q.status='frozen' AND e.status='active') "
+            + condition + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
             params,
         ).fetchone()
 

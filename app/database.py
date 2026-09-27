@@ -252,7 +252,7 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     parameter_digest TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
     idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','frozen','cancel_requested','cancelled','succeeded','failed')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
     available_at TEXT NOT NULL,
@@ -363,6 +363,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_frozen_task_status(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -385,6 +386,61 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+    # 辐射隔离表是调度守卫查询的依赖；延迟导入避免循环依赖
+    from app.radiation.service import ensure_schema as ensure_radiation_schema
+
+    ensure_radiation_schema()
+
+
+def _ensure_frozen_task_status(connection: sqlite3.Connection) -> None:
+    """旧库的 compute_tasks 状态约束不包含 frozen，按 SQLite 12 步流程幂等重建。"""
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='compute_tasks'").fetchone()
+    if row is None or "'frozen'" in (row[0] or ""):
+        return
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS compute_tasks_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,
+            project_code TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            parameters_json TEXT NOT NULL,
+            parameter_digest TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+            idempotency_key TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','frozen','cancel_requested','cancelled','succeeded','failed')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+            available_at TEXT NOT NULL,
+            lease_owner TEXT NOT NULL DEFAULT '',
+            lease_expires_at TEXT NOT NULL DEFAULT '',
+            current_result_version INTEGER,
+            last_error_code TEXT NOT NULL DEFAULT '',
+            last_error_message TEXT NOT NULL DEFAULT '',
+            version INTEGER NOT NULL DEFAULT 1,
+            started_at TEXT,
+            finished_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(requested_by, idempotency_key)
+        );
+        INSERT INTO compute_tasks_new
+            (id,template_id,project_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,
+            status,attempt_count,max_attempts,available_at,lease_owner,lease_expires_at,current_result_version,
+            last_error_code,last_error_message,version,started_at,finished_at,created_at,updated_at)
+        SELECT
+            id,template_id,project_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,
+            status,attempt_count,max_attempts,available_at,
+            COALESCE(lease_owner,''),COALESCE(lease_expires_at,''),current_result_version,
+            COALESCE(last_error_code,''),COALESCE(last_error_message,''),
+            COALESCE(version,1),started_at,finished_at,created_at,updated_at
+        FROM compute_tasks;
+        DROP TABLE compute_tasks;
+        ALTER TABLE compute_tasks_new RENAME TO compute_tasks;
+        CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at);
+        CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at);
+        """
+    )
 
 
 def migrate_db() -> None:
